@@ -6,8 +6,9 @@ use crate::{
     error::WifiResult,
     theme,
     wifi::{
-        WifiInfo, connect_profile, disconnect, disconnect_and_wait, forget_network,
-        get_connected_ssid, get_saved_profiles, get_wifi_networks, scan_networks,
+        ConnectionEvent, WifiInfo, connect_profile, disconnect, disconnect_and_wait,
+        forget_network, get_connected_ssid, get_saved_profiles, get_wifi_networks, scan_networks,
+        start_wifi_listener,
     },
 };
 use color_eyre::eyre::{Result, eyre};
@@ -27,10 +28,15 @@ use ratatui::{
 use std::{
     collections::HashSet,
     io::{self, IsTerminal, Write},
-    sync::mpsc::{self, Receiver, TryRecvError},
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+        mpsc::{self, Receiver, TryRecvError},
+    },
     thread,
     time::{Duration, Instant},
 };
+use tokio::sync::mpsc::UnboundedReceiver;
 
 #[derive(Clone, Copy)]
 enum RowStatus<'a> {
@@ -69,19 +75,10 @@ impl Drop for InlineTerminalGuard {
 pub fn run(search_term: &str, use_ascii_icons: bool) -> Result<()> {
     let saved_profiles = get_saved_profiles()
         .map_err(|error| eyre!(format!("Could not read saved networks: {error}")))?;
-    // Best-effort scan: warn and continue with whatever metadata can be
-    // read; `connect_profile` works even when the target was not scanned.
-    if let Err(error) = scan_networks() {
-        eprintln!("Warning: could not scan current networks: {error}");
-    }
-    thread::sleep(Duration::from_millis(config::SCAN_DELAY_MS));
-    let network_metadata = match get_wifi_networks() {
-        Ok(networks) => networks,
-        Err(error) => {
-            eprintln!("Warning: could not read current networks: {error}");
-            Vec::new()
-        }
-    };
+    // Open the UI from the current scan cache immediately. A missing saved
+    // profile is still shown as a saved fallback row and refined by the
+    // background scan started below.
+    let network_metadata = read_current_networks();
     let connected_ssid = get_connected_ssid().ok().flatten();
     let mut rows = matching_rows(
         search_term,
@@ -94,6 +91,17 @@ pub fn run(search_term: &str, use_ascii_icons: bool) -> Result<()> {
         println!("No saved networks matched \"{search_term}\".");
         return Ok(());
     }
+
+    // Watch OS connection notifications so quick connect can react to a
+    // failure immediately instead of polling for a full minute.
+    let (connection_event_tx, mut connection_event_rx) = tokio::sync::mpsc::unbounded_channel();
+    let _connection_listener = match start_wifi_listener(connection_event_tx) {
+        Ok(listener) => Some(listener),
+        Err(error) => {
+            eprintln!("Warning: could not listen for Wi-Fi connection events: {error}");
+            None
+        }
+    };
 
     let icon_set = if use_ascii_icons {
         IconSet::Ascii
@@ -110,21 +118,40 @@ pub fn run(search_term: &str, use_ascii_icons: bool) -> Result<()> {
         .hide_cursor()
         .map_err(|error| eyre!(format!("Could not hide terminal cursor: {error}")))?;
 
+    let scan_job = if rows.len() > 1 {
+        Some(ScanJob::spawn(
+            rows.iter().map(|row| row.ssid.clone()).collect(),
+        ))
+    } else {
+        None
+    };
+
     let selected = if rows.len() > 1 {
-        choose_profile(&mut terminal, &mut rows, icon_set)?
+        choose_profile(&mut terminal, &mut rows, icon_set, scan_job.as_ref())?
     } else {
         Some(0)
     };
+
+    // Stop the background scan before associating; scans can interfere with
+    // the connection attempt.
+    drop(scan_job);
 
     if rows.is_empty() {
         exit_with_message(&mut terminal, "All matching saved networks were forgotten.")?;
         return Ok(());
     }
 
-    // Out-of-range fallbacks would burn the whole timeout with no chance
-    // of success, so leave the entry on screen instead of connecting.
-    if let Some(selected) = selected.filter(|&index| !is_out_of_range(&rows[index])) {
-        run_inline_operation(&mut terminal, &rows, selected, icon_set)?;
+    // A saved profile may be missing from the latest scan (hidden network or
+    // a slow scan). Try connecting anyway: the OS can connect from the saved
+    // profile, and a genuinely out-of-range target fails via the OS timeout.
+    if let Some(selected) = selected {
+        run_inline_operation(
+            &mut terminal,
+            &rows,
+            selected,
+            icon_set,
+            &mut connection_event_rx,
+        )?;
     } else {
         terminal.clear()?;
         draw_rows(
@@ -139,6 +166,103 @@ pub fn run(search_term: &str, use_ascii_icons: bool) -> Result<()> {
 
     exit_below_rows(&mut terminal, rows.len())?;
     Ok(())
+}
+
+/// Background scan that feeds updated network metadata to the picker without
+/// blocking the first frame. Cancelled and joined when the picker closes so a
+/// scan cannot interfere with the connection attempt.
+struct ScanJob {
+    rx: Receiver<Vec<WifiInfo>>,
+    cancel: Arc<AtomicBool>,
+    handle: Option<thread::JoinHandle<()>>,
+}
+
+impl ScanJob {
+    fn spawn(targets: Vec<String>) -> Self {
+        let (tx, rx) = mpsc::channel();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let worker_cancel = Arc::clone(&cancel);
+        let handle = thread::spawn(move || {
+            let deadline =
+                Instant::now() + Duration::from_millis(config::QUICK_CONNECT_SCAN_TIMEOUT_MS);
+            let mut next_scan = Instant::now();
+
+            while !worker_cancel.load(Ordering::SeqCst) && Instant::now() < deadline {
+                if Instant::now() >= next_scan {
+                    let _ = scan_networks();
+                    next_scan =
+                        Instant::now() + Duration::from_millis(config::QUICK_CONNECT_SCAN_RETRY_MS);
+                }
+
+                thread::sleep(Duration::from_millis(config::QUICK_CONNECT_SCAN_POLL_MS));
+
+                if worker_cancel.load(Ordering::SeqCst) {
+                    break;
+                }
+
+                if let Ok(networks) = get_wifi_networks() {
+                    let done = all_profiles_seen_in_scan(&targets, &networks);
+                    if tx.send(networks).is_err() || done {
+                        break;
+                    }
+                }
+            }
+        });
+
+        Self {
+            rx,
+            cancel,
+            handle: Some(handle),
+        }
+    }
+}
+
+impl Drop for ScanJob {
+    fn drop(&mut self) {
+        self.cancel.store(true, Ordering::SeqCst);
+        if let Some(handle) = self.handle.take() {
+            let _ = handle.join();
+        }
+    }
+}
+
+fn read_current_networks() -> Vec<WifiInfo> {
+    match get_wifi_networks() {
+        Ok(networks) => networks,
+        Err(error) => {
+            eprintln!("Warning: could not read current networks: {error}");
+            Vec::new()
+        }
+    }
+}
+
+fn all_profiles_seen_in_scan(profiles: &[String], networks: &[WifiInfo]) -> bool {
+    profiles
+        .iter()
+        .all(|ssid| networks.iter().any(|network| network.ssid == *ssid))
+}
+
+/// Copy fresh radio metadata into the picker rows while keeping their saved
+/// and connected flags.
+fn apply_scan_metadata(rows: &mut [WifiInfo], networks: &[WifiInfo]) {
+    for row in rows {
+        let Some(network) = networks.iter().find(|network| network.ssid == row.ssid) else {
+            continue;
+        };
+
+        let was_connected = row.is_connected;
+        row.authentication = network.authentication.clone();
+        row.encryption = network.encryption.clone();
+        row.signal = network.signal;
+        row.channel = network.channel;
+        row.frequency = network.frequency;
+        row.link_speed = network.link_speed;
+        row.phy_type = network.phy_type.clone();
+        row.bssid = network.bssid.clone();
+        row.is_saved = true;
+        row.is_connected = was_connected || network.is_connected;
+        row.auto_connect = network.auto_connect;
+    }
 }
 
 /// Clear the viewport and leave a one-line message where the rows were.
@@ -213,6 +337,7 @@ fn choose_profile(
     terminal: &mut DefaultTerminal,
     rows: &mut Vec<WifiInfo>,
     icon_set: IconSet,
+    scan_job: Option<&ScanJob>,
 ) -> Result<Option<usize>> {
     let mut selected = 0;
     draw_rows(terminal, rows, selected, icon_set, RowStatus::Normal, 0)?;
@@ -222,6 +347,13 @@ fn choose_profile(
     }
 
     loop {
+        if let Some(job) = scan_job {
+            while let Ok(networks) = job.rx.try_recv() {
+                apply_scan_metadata(rows, &networks);
+                draw_rows(terminal, rows, selected, icon_set, RowStatus::Normal, 0)?;
+            }
+        }
+
         if !event::poll(Duration::from_millis(config::EVENT_POLL_MS))? {
             continue;
         }
@@ -294,6 +426,7 @@ fn run_inline_operation(
     rows: &[WifiInfo],
     selected: usize,
     icon_set: IconSet,
+    events: &mut UnboundedReceiver<ConnectionEvent>,
 ) -> Result<()> {
     let ssid = rows[selected].ssid.clone();
     let operation = if rows[selected].is_connected
@@ -303,21 +436,40 @@ fn run_inline_operation(
     } else {
         Operation::Connect
     };
+    let timeout = if is_out_of_range(&rows[selected]) {
+        Duration::from_secs(config::UNSEEN_CONNECTION_TIMEOUT_SECS)
+    } else {
+        Duration::from_secs(config::CONNECTION_TIMEOUT_SECS)
+    };
+    // Drop notifications accumulated while the picker was open; only events
+    // produced by this operation should affect the result.
+    while events.try_recv().is_ok() {}
     let (result_tx, result_rx) = mpsc::channel();
     let target_ssid = ssid.clone();
-    thread::spawn(move || {
+    let cancel = Arc::new(AtomicBool::new(false));
+    let worker_cancel = Arc::clone(&cancel);
+    let worker = thread::spawn(move || {
         let result = match operation {
-            Operation::Connect => connect_saved_profile(&target_ssid),
+            Operation::Connect => connect_saved_profile(&target_ssid, &worker_cancel),
             Operation::Disconnect => disconnect(),
         };
         let _ = result_tx.send(result);
     });
 
     let result = wait_for_operation(
-        terminal, rows, selected, &ssid, operation, icon_set, result_rx,
+        terminal, rows, selected, &ssid, operation, icon_set, result_rx, &cancel, events, timeout,
     );
     let status = match (operation, result) {
         (_, Ok(WaitOutcome::Cancelled)) => {
+            cancel.store(true, Ordering::SeqCst);
+            if matches!(operation, Operation::Connect) {
+                // Abort the association that may already be in flight. The
+                // worker also re-checks the flag before and after connecting.
+                let _ = disconnect();
+                // Wait for the worker so a late WlanConnect request cannot
+                // outlive the cancelled quick-connect process.
+                let _ = worker.join();
+            }
             terminal.clear()?;
             draw_rows(terminal, rows, selected, icon_set, RowStatus::Normal, 0)?;
             return Ok(());
@@ -332,7 +484,11 @@ fn run_inline_operation(
     Ok(())
 }
 
-fn connect_saved_profile(ssid: &str) -> WifiResult<()> {
+fn connect_saved_profile(ssid: &str, cancel: &AtomicBool) -> WifiResult<()> {
+    if cancel.load(Ordering::SeqCst) {
+        return Ok(());
+    }
+
     let current_ssid = get_connected_ssid().ok().flatten();
     if current_ssid
         .as_deref()
@@ -340,7 +496,20 @@ fn connect_saved_profile(ssid: &str) -> WifiResult<()> {
     {
         disconnect_and_wait()?;
     }
-    connect_profile(ssid)
+
+    if cancel.load(Ordering::SeqCst) {
+        return Ok(());
+    }
+
+    connect_profile(ssid)?;
+
+    // Esc can arrive while WlanConnect is being submitted. Undo the
+    // association here as well so a cancelled quick connect does not connect
+    // after the picker has already exited.
+    if cancel.load(Ordering::SeqCst) {
+        let _ = disconnect();
+    }
+    Ok(())
 }
 
 fn wait_for_operation(
@@ -351,8 +520,11 @@ fn wait_for_operation(
     operation: Operation,
     icon_set: IconSet,
     result_rx: Receiver<WifiResult<()>>,
+    cancel: &AtomicBool,
+    events: &mut UnboundedReceiver<ConnectionEvent>,
+    timeout: Duration,
 ) -> Result<WaitOutcome> {
-    let deadline = Instant::now() + Duration::from_secs(config::CONNECTION_TIMEOUT_SECS);
+    let deadline = Instant::now() + timeout;
     let anim_start = Instant::now();
     draw_rows(
         terminal,
@@ -364,18 +536,24 @@ fn wait_for_operation(
     )?;
 
     loop {
-        if cancellation_requested()? {
+        if check_cancellation(cancel)? {
             return Ok(WaitOutcome::Cancelled);
+        }
+
+        if let Some(outcome) = connection_event_outcome(events, operation, ssid) {
+            return outcome;
         }
 
         match result_rx.try_recv() {
             Ok(Ok(())) => {
                 return match operation {
                     Operation::Connect => wait_until_connected(
-                        terminal, rows, selected, ssid, icon_set, deadline, anim_start,
+                        terminal, rows, selected, ssid, icon_set, deadline, anim_start, cancel,
+                        events,
                     ),
                     Operation::Disconnect => wait_until_disconnected(
-                        terminal, rows, selected, ssid, icon_set, deadline, anim_start,
+                        terminal, rows, selected, ssid, icon_set, deadline, anim_start, cancel,
+                        events,
                     ),
                 };
             }
@@ -433,6 +611,52 @@ fn cancellation_requested() -> Result<bool> {
     Ok(false)
 }
 
+/// Check the shared cancel flag first, then drain pending key presses. Any
+/// observed cancellation is published to the worker thread.
+fn check_cancellation(cancel: &AtomicBool) -> Result<bool> {
+    if cancel.load(Ordering::SeqCst) {
+        return Ok(true);
+    }
+    if cancellation_requested()? {
+        cancel.store(true, Ordering::SeqCst);
+        return Ok(true);
+    }
+    Ok(false)
+}
+
+/// Translate the first relevant OS notification into a wait outcome.
+/// `connection_complete` is terminal; earlier attempt failures are ignored by
+/// the Windows listener because a later retry can still succeed.
+fn connection_event_outcome(
+    events: &mut UnboundedReceiver<ConnectionEvent>,
+    operation: Operation,
+    ssid: &str,
+) -> Option<Result<WaitOutcome>> {
+    while let Ok(event) = events.try_recv() {
+        match event {
+            ConnectionEvent::Connected(connected)
+                if matches!(operation, Operation::Connect) && connected == ssid =>
+            {
+                return Some(Ok(WaitOutcome::Completed));
+            }
+            ConnectionEvent::Failed {
+                ssid: failed_ssid,
+                reason_str,
+                ..
+            } if matches!(operation, Operation::Connect)
+                && (failed_ssid.is_empty() || failed_ssid == ssid) =>
+            {
+                return Some(Err(eyre!("Connection failed: {reason_str}")));
+            }
+            ConnectionEvent::Disconnected if matches!(operation, Operation::Disconnect) => {
+                return Some(Ok(WaitOutcome::Completed));
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
 fn loading_status<'a>(operation: Operation, ssid: &'a str) -> RowStatus<'a> {
     match operation {
         Operation::Connect => RowStatus::Connecting(ssid),
@@ -448,11 +672,17 @@ fn wait_until_connected(
     icon_set: IconSet,
     deadline: Instant,
     anim_start: Instant,
+    cancel: &AtomicBool,
+    events: &mut UnboundedReceiver<ConnectionEvent>,
 ) -> Result<WaitOutcome> {
     let mut tick = 0;
     loop {
-        if cancellation_requested()? {
+        if check_cancellation(cancel)? {
             return Ok(WaitOutcome::Cancelled);
+        }
+
+        if let Some(outcome) = connection_event_outcome(events, Operation::Connect, ssid) {
+            return outcome;
         }
 
         if tick % config::STATUS_POLL_FRAMES == 0
@@ -488,11 +718,17 @@ fn wait_until_disconnected(
     icon_set: IconSet,
     deadline: Instant,
     anim_start: Instant,
+    cancel: &AtomicBool,
+    events: &mut UnboundedReceiver<ConnectionEvent>,
 ) -> Result<WaitOutcome> {
     let mut tick = 0;
     loop {
-        if cancellation_requested()? {
+        if check_cancellation(cancel)? {
             return Ok(WaitOutcome::Cancelled);
+        }
+
+        if let Some(outcome) = connection_event_outcome(events, Operation::Disconnect, ssid) {
+            return outcome;
         }
 
         if tick % config::STATUS_POLL_FRAMES == 0
@@ -740,5 +976,77 @@ mod tests {
             rows.iter().map(|row| row.ssid.as_str()).collect::<Vec<_>>(),
             vec!["K4", "KP PG 204"]
         );
+    }
+
+    #[test]
+    fn all_profiles_seen_in_scan_requires_every_target() {
+        let networks = vec![discovered("Current 204", false)];
+        let targets = |names: &[&str]| {
+            names
+                .iter()
+                .map(|ssid| ssid.to_string())
+                .collect::<Vec<_>>()
+        };
+
+        assert!(all_profiles_seen_in_scan(
+            &targets(&["Current 204"]),
+            &networks
+        ));
+        assert!(all_profiles_seen_in_scan(&targets(&[]), &networks));
+        assert!(!all_profiles_seen_in_scan(
+            &targets(&["Current 204", "Stale 204"]),
+            &networks
+        ));
+        assert!(!all_profiles_seen_in_scan(
+            &targets(&["Stale 204"]),
+            &networks
+        ));
+    }
+
+    #[test]
+    fn apply_scan_metadata_fills_in_a_saved_fallback_row() {
+        let mut row = WifiInfo::saved_fallback("Home 204".to_string(), false);
+        let networks = [discovered("Home 204", false)];
+        apply_scan_metadata(std::slice::from_mut(&mut row), &networks);
+
+        assert!(row.is_saved);
+        assert_eq!(row.signal, 80);
+        assert_eq!(row.channel, 6);
+        assert_eq!(row.frequency, 2_437_000);
+        assert_eq!(row.bssid.as_deref(), Some("aa:bb:cc:dd:ee:ff"));
+        assert!(!is_out_of_range(&row));
+    }
+
+    #[test]
+    fn terminal_connection_failure_matches_target_and_empty_ssids() {
+        for failed_ssid in ["Target", ""] {
+            let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+            tx.send(ConnectionEvent::Failed {
+                ssid: failed_ssid.to_string(),
+                reason_code: 0x00028002,
+                reason_str: "Association Failed".to_string(),
+            })
+            .unwrap();
+
+            let outcome = connection_event_outcome(&mut rx, Operation::Connect, "Target");
+            assert!(matches!(outcome, Some(Err(_))));
+        }
+    }
+
+    #[test]
+    fn unrelated_disconnect_does_not_cancel_a_connect_wait() {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        tx.send(ConnectionEvent::Disconnected).unwrap();
+
+        assert!(connection_event_outcome(&mut rx, Operation::Connect, "Target").is_none());
+    }
+
+    #[test]
+    fn disconnect_event_completes_disconnect_wait() {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        tx.send(ConnectionEvent::Disconnected).unwrap();
+
+        let outcome = connection_event_outcome(&mut rx, Operation::Disconnect, "Target");
+        assert!(matches!(outcome, Some(Ok(WaitOutcome::Completed))));
     }
 }

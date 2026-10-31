@@ -64,6 +64,10 @@ pub enum WifiError {
     ProfileGetFailed { code: u32 },
 
     #[cfg(windows)]
+    #[error("Failed to list saved Wi-Fi profiles (code: {code})")]
+    ProfileListFailed { code: u32 },
+
+    #[cfg(windows)]
     #[error("Failed to set profile (code: {code}, reason: {reason})")]
     ProfileSetFailed { code: u32, reason: u32 },
 

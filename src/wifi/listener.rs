@@ -54,7 +54,6 @@ unsafe extern "system" fn notification_callback(
     }
 
     if data.NotificationCode == wlan_notification_acm_connection_complete.0 as u32
-        || data.NotificationCode == wlan_notification_acm_connection_attempt_fail.0 as u32
         || data.NotificationCode == wlan_notification_acm_disconnected.0 as u32
     {
         if data.dwDataSize < std::mem::size_of::<WLAN_CONNECTION_NOTIFICATION_DATA>() as u32 {
@@ -71,18 +70,23 @@ unsafe extern "system" fn notification_callback(
         let ssid = String::from_utf8_lossy(ssid_bytes).to_string();
 
         if data.NotificationCode == wlan_notification_acm_connection_complete.0 as u32 {
-            let _ = sender.send(ConnectionEvent::Connected(ssid));
-        } else if data.NotificationCode == wlan_notification_acm_disconnected.0 as u32 {
-            let _ = sender.send(ConnectionEvent::Disconnected);
-        } else if data.NotificationCode == wlan_notification_acm_connection_attempt_fail.0 as u32 {
+            // connection_complete is the terminal notification: a non-zero
+            // reason code means every attempt failed. The earlier
+            // connection_attempt_fail notifications are deliberately ignored
+            // because a later attempt can still succeed.
             let reason_code = conn_data.wlanReasonCode;
-            let reason_str = wlan_reason_to_string(reason_code);
-
-            let _ = sender.send(ConnectionEvent::Failed {
-                ssid,
-                reason_code,
-                reason_str,
-            });
+            if reason_code == 0 {
+                let _ = sender.send(ConnectionEvent::Connected(ssid));
+            } else {
+                let reason_str = wlan_reason_to_string(reason_code);
+                let _ = sender.send(ConnectionEvent::Failed {
+                    ssid,
+                    reason_code,
+                    reason_str,
+                });
+            }
+        } else {
+            let _ = sender.send(ConnectionEvent::Disconnected);
         }
     }
 }

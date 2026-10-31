@@ -251,7 +251,7 @@ pub async fn run(mut terminal: DefaultTerminal, state: &mut AppState) -> Result<
                             .connection
                             .target_ssid
                             .as_deref()
-                            .is_some_and(|target| target == ssid)
+                            .is_some_and(|target| ssid.is_empty() || target == ssid)
                     {
                         state.connection.finish_connection_attempt();
                         state.ui.error_message = Some(format!("Connection failed: {}", reason_str));

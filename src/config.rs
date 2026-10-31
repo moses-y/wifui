@@ -14,6 +14,14 @@ pub const OPEN_PROFILE_REGISTRATION_DELAY_MS: u64 = 1000;
 pub const DISCONNECT_DELAY_MS: u64 = 500;
 pub const SCAN_DELAY_MS: u64 = 2000;
 pub const AUTO_REFRESH_INTERVAL_SECS: u64 = 10;
+// Quick connect: WlanScan is asynchronous, so poll the cache until the
+// requested saved network appears instead of trusting a single fixed delay.
+pub const QUICK_CONNECT_SCAN_TIMEOUT_MS: u64 = 6000;
+pub const QUICK_CONNECT_SCAN_POLL_MS: u64 = 250;
+pub const QUICK_CONNECT_SCAN_RETRY_MS: u64 = 3000;
+// A saved profile that never appeared in the scan gets a shorter fallback
+// timeout so a genuinely out-of-range network cannot stall for a full minute.
+pub const UNSEEN_CONNECTION_TIMEOUT_SECS: u64 = 20;
 pub const ETHERNET_STATUS_REFRESH_INTERVAL_SECS: u64 = 5;
 pub const SEARCHING_REFRESH_INTERVAL_SECS: u64 = 15;
 pub const BURST_REFRESH_INTERVAL_SECS: u64 = 1;

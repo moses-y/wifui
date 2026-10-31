@@ -33,6 +33,29 @@ cargo test --offline
 
 `--ascii` avoids requiring a Nerd Font while testing the TUI. The application expects an interactive terminal; use a PTY when testing launch, key handling, or rendering.
 
+## Research before implementing
+
+- Before implementing or changing platform-specific behavior, search the internet and prefer primary documentation. This applies to the Windows WLAN API, NetworkManager/iwd D-Bus APIs, terminal/crossterm behavior, and crate APIs. Do not rely on assumptions from memory.
+
+Primary references:
+
+- [WlanConnect](https://learn.microsoft.com/en-us/windows/win32/api/wlanapi/nf-wlanapi-wlanconnect)
+- [WLAN_NOTIFICATION_ACM](https://learn.microsoft.com/en-us/windows/win32/api/wlanapi/ne-wlanapi-wlan_notification_acm-r1)
+- [WLAN_CONNECTION_NOTIFICATION_DATA](https://learn.microsoft.com/en-us/windows/win32/api/wlanapi/ns-wlanapi-wlan_connection_notification_data)
+
+### Windows WLAN notification facts
+
+- `WlanScan` returns immediately; results arrive asynchronously. Use `wlan_notification_acm_scan_complete`/`wlan_notification_acm_scan_fail` or bounded polling instead of trusting a single fixed sleep.
+- `WlanConnect` also returns immediately. `wlan_notification_acm_connection_complete` is the terminal notification: success is `wlanReasonCode == WLAN_REASON_CODE_SUCCESS` (0); any other reason code is a failure.
+- `wlan_notification_acm_connection_attempt_fail` is non-terminal. Zero or more attempt failures can occur before a later attempt succeeds, so it must not be treated as final failure.
+- `wlan_notification_acm_disconnected` reports the end of a connection.
+
+## Commit messages
+
+- Use a short conventional-commit subject: `feat:`, `fix:`, `docs:`, `refactor:`, `test:`, or `chore:`.
+- Add a scope when useful, for example: `feat(quick-connect): open the picker without waiting for scans`.
+- Keep the subject short and imperative. Avoid long bodies unless a non-obvious reason must be recorded.
+
 ## Architecture at a glance
 
 ```text
@@ -75,7 +98,7 @@ The normal runtime flow is:
 | `src/event/mod.rs` | Main async event loop, background task result handling, listener setup |
 | `src/event/handlers.rs` | Keyboard handlers, connection/profile actions, search, QR generation, and clipboard copy |
 | `src/input.rs` | Editable input state and cursor/word navigation |
-| `src/quick_connect.rs` | Non-interactive saved-network matching and inline connect/disconnect flow |
+| `src/quick_connect.rs` | Saved-network matching, bounded scan polling, inline connect/disconnect flow with connection notifications and cancellation |
 | `src/ui.rs` | Ratatui rendering split into per-panel functions (list, details, popups) with shared input-scrolling and spinner helpers |
 | `src/theme.rs` | Shared TUI colors and styles |
 | `src/wifi/mod.rs` | Platform facade and compile-time backend selection |

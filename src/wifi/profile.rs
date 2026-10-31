@@ -137,23 +137,29 @@ pub fn get_saved_profiles() -> WifiResult<Vec<String>> {
         let mut profile_list: *mut WLAN_PROFILE_INFO_LIST = std::ptr::null_mut();
         let result = WlanGetProfileList(handle.as_raw(), &guid, None, &mut profile_list);
 
-        if result == ERROR_SUCCESS.0 {
-            let num_items = (*profile_list).dwNumberOfItems;
-            let items = std::slice::from_raw_parts(
-                (*profile_list).ProfileInfo.as_ptr(),
-                num_items as usize,
-            );
-
-            for item in items {
-                let name = String::from_utf16_lossy(&item.strProfileName);
-                // Trim null characters if any
-                let name = name.trim_matches(char::from(0)).to_string();
-                if !name.is_empty() {
-                    profiles.push(name);
-                }
-            }
-            WlanFreeMemory(profile_list as *mut _);
+        if result != ERROR_SUCCESS.0 {
+            return Err(WifiError::ProfileListFailed { code: result });
         }
+
+        if profile_list.is_null() {
+            return Err(WifiError::Internal(
+                "WlanGetProfileList returned a null profile list".to_string(),
+            ));
+        }
+
+        let num_items = (*profile_list).dwNumberOfItems;
+        let items =
+            std::slice::from_raw_parts((*profile_list).ProfileInfo.as_ptr(), num_items as usize);
+
+        for item in items {
+            let name = String::from_utf16_lossy(&item.strProfileName);
+            // Trim null characters if any
+            let name = name.trim_matches(char::from(0)).to_string();
+            if !name.is_empty() {
+                profiles.push(name);
+            }
+        }
+        WlanFreeMemory(profile_list as *mut _);
     }
 
     Ok(profiles)
